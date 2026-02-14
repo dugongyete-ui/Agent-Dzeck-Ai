@@ -144,14 +144,32 @@ def initialize_system():
     logger.info("Interaction initialized")
     return interaction
 
-try:
-    interaction = initialize_system()
-except Exception as e:
-    logger.error(f"Failed to initialize system: {str(e)}")
-    print(f"[Agent Dzeck AI] FATAL: Failed to initialize system: {str(e)}")
-    interaction = None
+interaction = None
+is_initializing = False
+init_error = None
 is_generating = False
 query_resp_history = []
+
+async def lazy_initialize():
+    global interaction, is_initializing, init_error
+    if interaction is not None or is_initializing:
+        return
+    is_initializing = True
+    print("[Agent Dzeck AI] Starting background initialization...")
+    try:
+        loop = asyncio.get_event_loop()
+        interaction = await loop.run_in_executor(None, initialize_system)
+        print("[Agent Dzeck AI] System initialized successfully!")
+    except Exception as e:
+        init_error = str(e)
+        logger.error(f"Failed to initialize system: {str(e)}")
+        print(f"[Agent Dzeck AI] Init error: {str(e)}")
+    finally:
+        is_initializing = False
+
+@api.on_event("startup")
+async def startup_event():
+    asyncio.create_task(lazy_initialize())
 
 
 @api.websocket("/ws")
@@ -187,8 +205,11 @@ async def get_screenshot():
 @api.get("/health")
 async def health_check():
     logger.info("Health check endpoint called")
+    if is_initializing:
+        return {"status": "initializing", "version": "0.2.0", "message": "System is starting up..."}
     if interaction is None:
-        return {"status": "degraded", "version": "0.2.0", "error": "System not fully initialized. Check API key configuration."}
+        error_msg = init_error or "System not fully initialized. Check API key configuration."
+        return {"status": "degraded", "version": "0.2.0", "error": error_msg}
     return {
         "status": "healthy",
         "version": "0.2.0",
