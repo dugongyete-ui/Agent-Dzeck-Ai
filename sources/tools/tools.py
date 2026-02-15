@@ -160,51 +160,40 @@ class Tools():
         self.excutable_blocks_found = False
         return tmp
 
-    def _is_exact_tag_match(self, llm_text: str, pos: int) -> bool:
-        """
-        Check if the tag at position pos is an exact match (not a prefix of another tag).
-        E.g., ```c should not match ```css, ```java should not match ```javascript.
-        """
-        tag_end_pos = pos + len(f'```{self.tag}')
-        if tag_end_pos >= len(llm_text):
+    def _is_exact_tag_match(self, llm_text_lower: str, pos: int, tag_lower: str) -> bool:
+        tag_end_pos = pos + len(f'```{tag_lower}')
+        if tag_end_pos >= len(llm_text_lower):
             return True
-        next_char = llm_text[tag_end_pos]
+        next_char = llm_text_lower[tag_end_pos]
         return not next_char.isalpha()
 
     def load_exec_block(self, llm_text: str):
-        """
-        Extract code/query blocks from LLM-generated text and process them for execution.
-        This method parses the text looking for code blocks marked with the tool's tag (e.g. ```python).
-        Args:
-            llm_text (str): The raw text containing code blocks from the LLM
-        Returns:
-            tuple[list[str], str | None]: A tuple containing:
-                - List of extracted and processed code blocks
-                - The path the code blocks was saved to
-        """
         assert self.tag != "undefined", "Tag not defined"
-        start_tag = f'```{self.tag}' 
+        tag_lower = self.tag.lower()
+        start_tag = f'```{tag_lower}'
         end_tag = '```'
         code_blocks = []
         start_index = 0
         save_path = None
 
-        if start_tag not in llm_text:
+        llm_lower = llm_text.lower()
+
+        if start_tag not in llm_lower:
             return None, None
 
         while True:
-            start_pos = llm_text.find(start_tag, start_index)
+            start_pos = llm_lower.find(start_tag, start_index)
             if start_pos == -1:
                 break
 
-            if not self._is_exact_tag_match(llm_text, start_pos):
+            if not self._is_exact_tag_match(llm_lower, start_pos, tag_lower):
                 start_index = start_pos + len(start_tag)
                 continue
 
             line_start = llm_text.rfind('\n', 0, start_pos)+1
             leading_whitespace = llm_text[line_start:start_pos]
 
-            end_pos = llm_text.find(end_tag, start_pos + len(start_tag))
+            end_pos = llm_lower.find(end_tag, start_pos + len(start_tag))
             if end_pos == -1:
                 break
             content = llm_text[start_pos + len(start_tag):end_pos]
@@ -218,8 +207,11 @@ class Tools():
                         processed_lines.append(line)
                 content = '\n'.join(processed_lines)
 
-            if ':' in content.split('\n')[0]:
-                save_path = content.split('\n')[0].split(':')[1]
+            first_line = content.split('\n')[0]
+            if ':' in first_line:
+                raw_path = first_line.split(':', 1)[1].strip()
+                if raw_path:
+                    save_path = raw_path
                 content = content[content.find('\n')+1:]
             self.excutable_blocks_found = True
             code_blocks.append(content)
