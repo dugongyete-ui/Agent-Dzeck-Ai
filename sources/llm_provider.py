@@ -25,13 +25,14 @@ class Provider:
         self.available_providers = {
             "groq": self.groq_fn,
             "huggingface": self.huggingface_fn,
+            "magma": self.magma_fn,
             "test": self.test_fn
         }
         self.logger = Logger("provider.log")
         self.api_key = None
         self.unsafe_providers = ["groq", "huggingface"]
         if self.provider_name not in self.available_providers:
-            raise ValueError(f"Provider tidak dikenal: {provider_name}. Provider yang tersedia: groq, huggingface")
+            raise ValueError(f"Provider tidak dikenal: {provider_name}. Provider yang tersedia: groq, huggingface, magma")
         if self.provider_name in self.unsafe_providers and self.is_local == False:
             pretty_print(f"Menggunakan provider API: {provider_name}. Data akan dikirim ke cloud.", color="warning")
             self.api_key = self.get_api_key(self.provider_name)
@@ -149,6 +150,64 @@ class Provider:
         )
         thought = completion.choices[0].message
         return thought.content
+
+    def magma_fn(self, history, verbose=False):
+        import urllib.parse
+        last_message = ""
+        for msg in reversed(history):
+            if msg.get("role") == "user" and msg.get("content"):
+                last_message = msg["content"]
+                break
+        if not last_message:
+            last_message = history[-1].get("content", "") if history else ""
+
+        encoded_prompt = urllib.parse.quote(last_message, safe="")
+        url = f"https://magma-api.biz.id/ai/copilot?prompt={encoded_prompt}"
+
+        try:
+            response = requests.get(url, timeout=60, allow_redirects=True)
+            response.raise_for_status()
+            data = response.json()
+
+            if isinstance(data, dict) and data.get("status") is True:
+                result = data.get("result", {})
+                text = result.get("response", "")
+                if text:
+                    if verbose:
+                        print(text)
+                    return text
+
+            if isinstance(data, dict):
+                for key in ["response", "text", "content", "message", "answer", "output"]:
+                    if key in data and isinstance(data[key], str):
+                        if verbose:
+                            print(data[key])
+                        return data[key]
+                    if "result" in data and isinstance(data["result"], dict) and key in data["result"]:
+                        val = data["result"][key]
+                        if isinstance(val, str):
+                            if verbose:
+                                print(val)
+                            return val
+
+            text = response.text.strip()
+            if text:
+                if verbose:
+                    print(text)
+                return text
+
+            raise Exception("Magma API mengembalikan respons kosong.")
+        except requests.exceptions.Timeout:
+            raise Exception("Magma API timeout. Coba lagi nanti.")
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError("Tidak bisa terhubung ke Magma API.")
+        except requests.exceptions.HTTPError as e:
+            raise Exception(f"Magma API HTTP error: {str(e)}")
+        except ValueError:
+            text = response.text.strip()
+            if text:
+                return text
+            raise Exception("Magma API mengembalikan respons yang bukan JSON valid.")
 
     def test_fn(self, history, verbose=True):
         thought = """
