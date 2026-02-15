@@ -42,4 +42,4 @@ WORK_DIR = "/home/runner/workspace/work_dir"
 
 [deployment]
 deploymentTarget = "autoscale"
-run = ["bash", "-c", "python api.py"]
+run = ["bash", "start.sh"]
