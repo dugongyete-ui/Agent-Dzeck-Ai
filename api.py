@@ -757,6 +757,15 @@ async def get_model_config():
             "server": "https://api-inference.huggingface.co",
             "api_key_env": "HUGGINGFACE_API_KEY",
             "note": "Membutuhkan kredit HuggingFace"
+        },
+        "magma": {
+            "name": "Dzeck Ai",
+            "models": [
+                "copilot",
+            ],
+            "server": "https://magma-api.biz.id",
+            "api_key_env": "",
+            "note": "API publik, tanpa API key"
         }
     }
 
