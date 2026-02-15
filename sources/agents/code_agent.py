@@ -18,7 +18,7 @@ from sources.memory import Memory
 from sources.sandbox import Sandbox
 
 class CoderAgent(Agent):
-    def __init__(self, name, prompt_path, provider, verbose=False, use_sandbox=True):
+    def __init__(self, name, prompt_path, provider, verbose=False, use_sandbox=True, ws_manager=None):
         super().__init__(name, prompt_path, provider, verbose, None)
         self.tools = {
             "bash": BashInterpreter(),
@@ -50,6 +50,26 @@ class CoderAgent(Agent):
                         memory_compression=False,
                         model_provider=provider.get_model_name())
         self.installed_packages = set()
+        self.ws_manager = ws_manager
+        self.browser_agent = None
+        self.self_correction_max = 3
+
+    async def _notify_self_correction(self, attempt: int, max_retries: int, phase: str, details: str = ""):
+        if self.ws_manager:
+            try:
+                await self.ws_manager.broadcast({
+                    "type": "self_correction",
+                    "attempt": attempt,
+                    "max_retries": max_retries,
+                    "phase": phase,
+                    "details": details[:500],
+                    "agent": "code_agent",
+                })
+            except Exception:
+                pass
+
+    def set_browser_agent(self, browser_agent):
+        self.browser_agent = browser_agent
 
     def add_sys_info_prompt(self, prompt):
         templates_info = ", ".join([f"{t['key']} ({t['name']})" for t in self.scaffolder.list_templates()])
@@ -90,6 +110,22 @@ class CoderAgent(Agent):
     def _is_save_only_language(self, name: str) -> bool:
         return name in ('c', 'go', 'java', 'html', 'css', 'javascript', 'typescript', 'sql')
 
+    def _has_error_in_output(self, feedback: str) -> bool:
+        if not feedback:
+            return False
+        error_indicators = [
+            'Error', 'Exception', 'Traceback', 'SyntaxError',
+            'NameError', 'TypeError', 'ValueError', 'ImportError',
+            'ModuleNotFoundError', 'AttributeError', 'KeyError',
+            'IndexError', 'FileNotFoundError', 'PermissionError',
+            'RuntimeError', 'OSError', 'IOError', 'ZeroDivisionError',
+            'IndentationError', 'UnboundLocalError',
+        ]
+        for indicator in error_indicators:
+            if indicator in feedback:
+                return True
+        return False
+
     def _auto_install_from_error(self, error_text: str) -> bool:
         import re
         module_match = re.search(r"No module named ['\"]([^'\"]+)['\"]", error_text)
@@ -125,6 +161,54 @@ class CoderAgent(Agent):
         else:
             pretty_print(f"❌ Failed to install {pkg_name}: {result.get('stderr', '')}", color="failure")
             return False
+
+    async def _browse_for_install_help(self, package_name: str, error_text: str) -> str:
+        if not self.browser_agent:
+            return ""
+        try:
+            self.logger.info(f"Browsing for install help: {package_name}")
+            pretty_print(f"🌐 Mencari cara install {package_name} di web...", color="status")
+            if self.ws_manager:
+                try:
+                    await self.ws_manager.broadcast({
+                        "type": "multi_tool",
+                        "action": "browser_assist",
+                        "details": f"CoderAgent meminta BrowserAgent mencari cara install {package_name}",
+                        "agent": "code_agent",
+                    })
+                except Exception:
+                    pass
+            search_query = f"how to install {package_name} on Linux Ubuntu pip python"
+            answer, _ = await self.browser_agent.process(search_query, None)
+            if answer:
+                self.logger.info(f"Browser found install help: {answer[:200]}")
+                return answer[:1000]
+        except Exception as e:
+            self.logger.error(f"Browser assist failed: {str(e)}")
+        return ""
+
+    async def _request_browser_info(self, query: str) -> str:
+        if not self.browser_agent:
+            return ""
+        try:
+            self.logger.info(f"Requesting browser info: {query}")
+            pretty_print(f"🌐 CoderAgent meminta info dari BrowserAgent...", color="status")
+            if self.ws_manager:
+                try:
+                    await self.ws_manager.broadcast({
+                        "type": "multi_tool",
+                        "action": "browser_info_request",
+                        "details": f"CoderAgent meminta BrowserAgent: {query[:200]}",
+                        "agent": "code_agent",
+                    })
+                except Exception:
+                    pass
+            answer, _ = await self.browser_agent.process(query, None)
+            if answer:
+                return answer[:1500]
+        except Exception as e:
+            self.logger.error(f"Browser info request failed: {str(e)}")
+        return ""
 
     def _verify_saved_files(self, answer: str) -> str:
         import re
@@ -263,6 +347,125 @@ class CoderAgent(Agent):
             f"6. INGAT: TANPA app.run(), TANPA Tkinter, TANPA server start"
         )
 
+    def _build_self_correction_prompt(self, error_log: str, correction_attempt: int, max_corrections: int, browser_info: str = ""):
+        browser_context = ""
+        if browser_info:
+            browser_context = (
+                f"\n\n🌐 INFORMASI DARI WEB BROWSER:\n{browser_info}\n"
+                f"Gunakan informasi di atas untuk memperbaiki kode.\n"
+            )
+
+        return (
+            f"🔄 SELF-CORRECTION MODE (perbaikan {correction_attempt}/{max_corrections})\n\n"
+            f"Output sebelumnya mengandung ERROR:\n"
+            f"```\n{error_log[:1500]}\n```\n\n"
+            f"{browser_context}"
+            f"INSTRUKSI SELF-CORRECTION:\n"
+            f"1. Analisis error log di atas dengan TELITI\n"
+            f"2. Identifikasi AKAR PENYEBAB error\n"
+            f"3. Tulis ULANG kode yang SUDAH DIPERBAIKI secara LENGKAP\n"
+            f"4. Pastikan SEMUA import, syntax, dan logika benar\n"
+            f"5. Jika error berulang pada percobaan sebelumnya, GANTI PENDEKATAN sepenuhnya\n"
+            f"6. JANGAN jelaskan errornya, LANGSUNG tulis kode perbaikan\n"
+            f"7. INGAT: TANPA app.run(), TANPA Tkinter, TANPA server start\n"
+            f"8. Kamu HARUS menulis kode dalam blok ```bahasa:namafile"
+        )
+
+    async def _self_correct_execution(self, original_answer: str, error_feedback: str) -> tuple:
+        correction_attempt = 0
+        current_feedback = error_feedback
+        last_answer = original_answer
+
+        while correction_attempt < self.self_correction_max:
+            correction_attempt += 1
+            self.logger.info(f"Self-correction attempt {correction_attempt}/{self.self_correction_max}")
+            pretty_print(f"🔄 Self-Correction: percobaan {correction_attempt}/{self.self_correction_max}...", color="status")
+            self.status_message = f"🔄 Self-Correction {correction_attempt}/{self.self_correction_max}..."
+
+            await self._notify_self_correction(
+                correction_attempt, self.self_correction_max,
+                "analyzing_error",
+                f"Menganalisis error: {current_feedback[:200]}"
+            )
+
+            browser_info = ""
+            feedback_lower = current_feedback.lower()
+            if 'no module named' in feedback_lower or 'modulenotfounderror' in feedback_lower:
+                import re
+                module_match = re.search(r"No module named ['\"]([^'\"]+)['\"]", current_feedback)
+                if module_match:
+                    pkg_name = module_match.group(1).split('.')[0]
+                    install_ok = self._auto_install_from_error(current_feedback)
+                    if not install_ok and self.browser_agent:
+                        browser_info = await self._browse_for_install_help(pkg_name, current_feedback)
+
+            correction_prompt = self._build_self_correction_prompt(
+                current_feedback, correction_attempt, self.self_correction_max, browser_info
+            )
+            self.memory.push('user', correction_prompt)
+
+            await self._notify_self_correction(
+                correction_attempt, self.self_correction_max,
+                "generating_fix",
+                "LLM sedang membuat perbaikan kode..."
+            )
+
+            animate_thinking("Self-correcting...", color="status")
+            answer, reasoning = await self.llm_request()
+            self.last_reasoning = reasoning
+
+            if "```" not in answer:
+                self.logger.warning(f"Self-correction {correction_attempt}: No code block in response")
+                await self._notify_self_correction(
+                    correction_attempt, self.self_correction_max,
+                    "no_code",
+                    "LLM tidak menghasilkan kode perbaikan"
+                )
+                continue
+
+            self.show_answer()
+
+            await self._notify_self_correction(
+                correction_attempt, self.self_correction_max,
+                "executing_fix",
+                "Menjalankan kode perbaikan..."
+            )
+
+            self.blocks_result = []
+            exec_success, feedback = self.execute_modules_with_sandbox(answer) if self.use_sandbox else self.execute_modules(answer)
+
+            if exec_success and not self._has_error_in_output(feedback):
+                self.logger.info(f"Self-correction succeeded on attempt {correction_attempt}")
+                pretty_print(f"✅ Self-Correction berhasil pada percobaan {correction_attempt}!", color="success")
+                await self._notify_self_correction(
+                    correction_attempt, self.self_correction_max,
+                    "success",
+                    "Perbaikan berhasil!"
+                )
+                return True, answer, feedback
+
+            current_feedback = feedback
+            last_answer = answer
+            self.logger.info(f"Self-correction {correction_attempt} failed, error: {feedback[:200]}")
+            pretty_print(f"❌ Self-Correction {correction_attempt} gagal: {feedback[:200]}", color="failure")
+
+            await self._notify_self_correction(
+                correction_attempt, self.self_correction_max,
+                "retry" if correction_attempt < self.self_correction_max else "exhausted",
+                f"Perbaikan gagal: {feedback[:200]}"
+            )
+
+        self.logger.warning(f"Self-correction exhausted after {self.self_correction_max} attempts")
+        pretty_print(f"⚠️ Self-Correction selesai: {self.self_correction_max} percobaan habis", color="warning")
+
+        await self._notify_self_correction(
+            self.self_correction_max, self.self_correction_max,
+            "final_report",
+            f"Self-correction gagal setelah {self.self_correction_max} percobaan. Error terakhir: {current_feedback[:300]}"
+        )
+
+        return False, last_answer, current_feedback
+
     async def process(self, prompt, speech_module) -> str:
         answer = ""
         attempt = 0
@@ -312,6 +515,33 @@ class CoderAgent(Agent):
             self.logger.info(f"Attempt {attempt + 1}:\n{answer}")
             exec_success, feedback = self.execute_modules_with_sandbox(answer) if self.use_sandbox else self.execute_modules(answer)
             self.logger.info(f"Execution result: {exec_success}")
+
+            if exec_success and self._has_error_in_output(feedback):
+                self.logger.info("Output contains error indicators, triggering self-correction")
+                pretty_print("⚠️ Output mengandung error, memulai Self-Correction...", color="warning")
+                sc_success, sc_answer, sc_feedback = await self._self_correct_execution(answer, feedback)
+                if sc_success:
+                    answer = sc_answer
+                    feedback = sc_feedback
+                    exec_success = True
+                else:
+                    exec_success = False
+                    feedback = sc_feedback
+                    answer = sc_answer
+
+            if not exec_success and not self._has_error_in_output(feedback):
+                self.logger.info("Execution failed, triggering self-correction")
+                pretty_print("⚠️ Eksekusi gagal, memulai Self-Correction...", color="warning")
+                sc_success, sc_answer, sc_feedback = await self._self_correct_execution(answer, feedback)
+                if sc_success:
+                    answer = sc_answer
+                    feedback = sc_feedback
+                    exec_success = True
+                else:
+                    exec_success = False
+                    feedback = sc_feedback
+                    answer = sc_answer
+
             verification = self._verify_saved_files(answer) if exec_success else ""
             answer = self.remove_blocks(answer)
             if verification:

@@ -2,6 +2,7 @@ import asyncio
 import re
 import time
 import json
+import os
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from sources.logger import Logger
@@ -105,6 +106,17 @@ class AutonomousOrchestrator:
         self.last_answer = ""
         self.ws_manager = ws_manager
         self.persistent_memory = PersistentMemory()
+        self._setup_multi_tool()
+
+    def _setup_multi_tool(self):
+        if "coder" in self.agents and "web" in self.agents:
+            coder = self.agents["coder"]
+            browser = self.agents["web"]
+            if hasattr(coder, 'set_browser_agent'):
+                coder.set_browser_agent(browser)
+                self.logger.info("Multi-tool: CoderAgent linked to BrowserAgent")
+            if hasattr(coder, 'ws_manager') and self.ws_manager:
+                coder.ws_manager = self.ws_manager
 
     async def _notify_status(self, agent_name: str, status: str, progress: float = 0.0, details: str = ""):
         if self.ws_manager:
@@ -169,6 +181,79 @@ class AutonomousOrchestrator:
         self.plan = plan
         self.logger.info(f"Plan created with {len(plan.steps)} steps for: {goal}")
         return plan
+
+    async def _coder_browse_for_install(self, package_name: str, error_text: str) -> str:
+        if "web" not in self.agents:
+            return ""
+        browser_agent = self.agents["web"]
+        try:
+            self.logger.info(f"Multi-tool: Browsing install guide for '{package_name}'")
+            pretty_print(f"🌐 Multi-Tool: Browsing cara install '{package_name}'...", color="status")
+
+            if self.ws_manager:
+                try:
+                    await self.ws_manager.broadcast({
+                        "type": "multi_tool",
+                        "action": "auto_browse_install",
+                        "details": f"CoderAgent gagal install '{package_name}', BrowserAgent mencari solusi...",
+                        "agent": "orchestrator",
+                    })
+                except Exception:
+                    pass
+
+            search_query = f"install {package_name} python pip Linux Ubuntu error fix"
+            answer, _ = await browser_agent.process(search_query, None)
+
+            if answer:
+                self.logger.info(f"Browser found install solution: {answer[:200]}")
+                return answer[:1500]
+        except Exception as e:
+            self.logger.error(f"Browse for install failed: {str(e)}")
+        return ""
+
+    async def _handle_install_failure_with_browsing(self, step: TaskStep, error_text: str) -> Optional[str]:
+        error_lower = error_text.lower()
+        if "no module named" not in error_lower and "pip install" not in error_lower and "modulenotfounderror" not in error_lower:
+            return None
+
+        module_match = re.search(r"No module named ['\"]?(\w+)", error_text, re.IGNORECASE)
+        if not module_match:
+            module_match = re.search(r"pip install (\w[\w\-]*)", error_text, re.IGNORECASE)
+        if not module_match:
+            return None
+
+        package_name = module_match.group(1)
+        self.logger.info(f"Detected install failure for: {package_name}")
+
+        browse_result = await self._coder_browse_for_install(package_name, error_text)
+        if not browse_result:
+            return None
+
+        install_commands = []
+        pip_patterns = re.findall(r'pip3?\s+install\s+[\w\-\.\[\]>=<]+(?:\s+[\w\-\.\[\]>=<]+)*', browse_result)
+        apt_patterns = re.findall(r'(?:sudo\s+)?apt(?:-get)?\s+install\s+[\w\-]+(?:\s+[\w\-]+)*', browse_result)
+        install_commands.extend(pip_patterns)
+        install_commands.extend(apt_patterns)
+
+        if install_commands:
+            retry_prompt = (
+                f"Berdasarkan pencarian web, berikut cara install '{package_name}':\n"
+                f"Perintah yang ditemukan:\n"
+            )
+            for cmd in install_commands[:5]:
+                retry_prompt += f"  - {cmd}\n"
+            retry_prompt += (
+                f"\nInfo lengkap dari web:\n{browse_result[:800]}\n\n"
+                f"Coba install menggunakan perintah di atas, lalu ulangi tugas asli:\n"
+                f"{step.description}"
+            )
+            return retry_prompt
+
+        return (
+            f"Info dari web tentang '{package_name}':\n{browse_result[:800]}\n\n"
+            f"Gunakan informasi ini untuk memperbaiki instalasi, lalu ulangi tugas:\n"
+            f"{step.description}"
+        )
 
     async def execute_step(self, step: TaskStep, required_infos: dict = None) -> Tuple[str, bool]:
         step.status = "running"
@@ -235,6 +320,35 @@ class AutonomousOrchestrator:
                 "timestamp": time.time(),
             })
 
+            if not success and agent_key == "coder":
+                browse_fix = await self._handle_install_failure_with_browsing(step, answer or "")
+                if browse_fix:
+                    self.logger.info("Retrying step with browser-assisted install info")
+                    pretty_print("🔄 Mencoba ulang dengan info dari browser...", color="status")
+
+                    if self.ws_manager:
+                        try:
+                            await self.ws_manager.broadcast({
+                                "type": "multi_tool",
+                                "action": "retry_with_browser_info",
+                                "details": f"Langkah {step.id} dicoba ulang dengan info instalasi dari web",
+                                "agent": "orchestrator",
+                            })
+                        except Exception:
+                            pass
+
+                    answer, reasoning = await agent.process(browse_fix, None)
+                    success = agent.get_success
+
+                    self.execution_memory.append({
+                        "step_id": step.id,
+                        "agent": agent_key,
+                        "success": success,
+                        "answer_preview": (answer or "")[:200],
+                        "timestamp": time.time(),
+                        "retry_with_browse": True,
+                    })
+
             if success:
                 self.persistent_memory.store_fact(
                     "execution_success",
@@ -288,14 +402,51 @@ class AutonomousOrchestrator:
         recovery_description = ""
 
         if "no module named" in error_lower or "import" in error_lower:
-            recovery_agent = failed_step.agent_type.lower()
             module_match = re.search(r"no module named ['\"]?(\w+)", error_lower)
             module_name = module_match.group(1) if module_match else "yang dibutuhkan"
-            recovery_description = (
-                f"[RECOVERY - INSTALL DEPENDENCY] "
-                f"Install dependency '{module_name}' terlebih dahulu menggunakan pip install, "
-                f"lalu ulangi tugas: {failed_step.description}"
+
+            recovery_agent = "web"
+            browse_step = TaskStep(
+                id=len(self.plan.steps) + 1,
+                description=(
+                    f"[MULTI-TOOL BROWSE] Cari cara install library '{module_name}' di Linux/Ubuntu. "
+                    f"Cari di web: 'how to install {module_name} python pip Linux'. "
+                    f"Catat perintah install yang benar."
+                ),
+                agent_type="web",
+                max_attempts=2,
+                dependencies=failed_step.dependencies,
             )
+            self.plan.steps.append(browse_step)
+            self.logger.info(f"Multi-tool: Added browse step {browse_step.id} to find install for '{module_name}'")
+
+            recovery_agent = "coder"
+            recovery_description = (
+                f"[RECOVERY - INSTALL DEPENDENCY WITH BROWSER INFO] "
+                f"Gunakan informasi dari langkah browsing sebelumnya untuk install '{module_name}'. "
+                f"Lalu ulangi tugas asli: {failed_step.description}"
+            )
+
+            retry_step = TaskStep(
+                id=len(self.plan.steps) + 1,
+                description=recovery_description,
+                agent_type=recovery_agent,
+                max_attempts=2,
+                dependencies=[str(browse_step.id)],
+            )
+
+            retry_step.id = len(self.plan.steps) + 1
+
+            recovery_description += (
+                f"\n\nERROR SEBELUMNYA:\n{(failed_step.error or 'Unknown error')[:500]}\n"
+                f"INSTRUKSI: Gunakan pendekatan BERBEDA. Jangan ulangi cara yang sama. "
+                f"Kamu dilarang meminta klarifikasi, langsung eksekusi."
+            )
+            retry_step.description = recovery_description
+            self.plan.steps.append(retry_step)
+            self.logger.info(f"Plan revised: browse step {browse_step.id} + retry step {retry_step.id} for failed step {failed_step.id}")
+            return
+
         elif "permission" in error_lower or "access denied" in error_lower:
             recovery_agent = "file"
             recovery_description = (
@@ -421,6 +572,201 @@ class AutonomousOrchestrator:
             "files_created": list(dict.fromkeys(files_created)),
         }
 
+    async def _visual_verification(self, goal: str, work_results: dict) -> Optional[str]:
+        goal_lower = goal.lower()
+        is_website_task = any(kw in goal_lower for kw in [
+            'website', 'web', 'html', 'landing', 'page', 'dashboard',
+            'portfolio', 'blog', 'toko', 'shop', 'e-commerce', 'frontend',
+            'halaman', 'situs', 'tampilan',
+        ])
+        if not is_website_task:
+            return None
+
+        if "web" not in self.agents:
+            self.logger.info("Visual verification skipped: no browser agent available")
+            return None
+
+        html_files = []
+        work_dir = "/home/runner/workspace/work"
+        if os.path.exists(work_dir):
+            for root, dirs, files in os.walk(work_dir):
+                for f in files:
+                    if f.endswith('.html'):
+                        html_files.append(os.path.join(root, f))
+
+        if not html_files:
+            self.logger.info("Visual verification skipped: no HTML files found")
+            return None
+
+        main_html = None
+        for f in html_files:
+            fname = os.path.basename(f).lower()
+            if fname == 'index.html':
+                main_html = f
+                break
+        if not main_html:
+            main_html = html_files[0]
+
+        self.logger.info(f"Visual verification: checking {main_html}")
+        pretty_print(f"🔍 Visual Verification: memeriksa {os.path.basename(main_html)}...", color="status")
+
+        if self.ws_manager:
+            try:
+                await self.ws_manager.broadcast({
+                    "type": "visual_verification",
+                    "phase": "starting",
+                    "file": main_html,
+                    "details": "Memulai verifikasi visual website...",
+                })
+            except Exception:
+                pass
+
+        screenshots_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".screenshots")
+        os.makedirs(screenshots_dir, exist_ok=True)
+
+        screenshot_taken = False
+        screenshot_path = os.path.join(screenshots_dir, f"visual_check_{int(time.time())}.png")
+
+        browser_agent = self.agents["web"]
+        if hasattr(browser_agent, 'browser') and browser_agent.browser:
+            try:
+                preview_url = f"file://{main_html}"
+                browser_agent.browser.go_to(preview_url)
+                await asyncio.sleep(2)
+                screenshot_taken = browser_agent.browser.screenshot(
+                    filename=os.path.basename(screenshot_path)
+                )
+                if screenshot_taken:
+                    src = os.path.join(browser_agent.browser.screenshot_folder if hasattr(browser_agent.browser, 'screenshot_folder') else '.', os.path.basename(screenshot_path))
+                    if os.path.exists(src) and src != screenshot_path:
+                        import shutil
+                        shutil.move(src, screenshot_path)
+                    self.logger.info(f"Screenshot saved: {screenshot_path}")
+            except Exception as e:
+                self.logger.error(f"Screenshot failed: {str(e)}")
+                screenshot_taken = False
+
+        if self.ws_manager:
+            try:
+                await self.ws_manager.broadcast({
+                    "type": "visual_verification",
+                    "phase": "screenshot_taken" if screenshot_taken else "screenshot_failed",
+                    "file": screenshot_path if screenshot_taken else "",
+                    "details": "Screenshot berhasil diambil" if screenshot_taken else "Gagal mengambil screenshot",
+                })
+            except Exception:
+                pass
+
+        with open(main_html, 'r', encoding='utf-8', errors='ignore') as f:
+            html_content = f.read()
+
+        visual_issues = []
+
+        if '<meta name="viewport"' not in html_content:
+            visual_issues.append("Tidak ada meta viewport (tidak responsive)")
+        if 'style' not in html_content and '<link' not in html_content:
+            visual_issues.append("Tidak ada CSS styling")
+        if 'position: absolute' in html_content or 'position:absolute' in html_content:
+            abs_count = html_content.count('position: absolute') + html_content.count('position:absolute')
+            if abs_count > 5:
+                visual_issues.append(f"Terlalu banyak position:absolute ({abs_count}x) - risiko elemen tumpang tindih")
+        if 'z-index' in html_content:
+            import re as _re
+            z_indices = _re.findall(r'z-index:\s*(\d+)', html_content)
+            if z_indices:
+                max_z = max(int(z) for z in z_indices)
+                if max_z > 100:
+                    visual_issues.append(f"z-index sangat tinggi ({max_z}) - risiko layering bermasalah")
+        if len(html_content) < 500:
+            visual_issues.append("File HTML sangat pendek - mungkin belum lengkap")
+        if '</html>' not in html_content:
+            visual_issues.append("Tag </html> penutup tidak ditemukan")
+        if '</body>' not in html_content:
+            visual_issues.append("Tag </body> penutup tidak ditemukan")
+
+        has_modern = any(kw in html_content.lower() for kw in [
+            'flexbox', 'flex', 'grid', 'gradient', 'border-radius',
+            'box-shadow', 'transition', 'transform', 'animation',
+            'rgba', 'var(--', 'media', '@keyframes',
+        ])
+        if not has_modern:
+            visual_issues.append("Tidak terdeteksi CSS modern (flexbox/grid/shadow/gradient)")
+
+        vision_analysis = ""
+        if screenshot_taken and os.path.exists(screenshot_path):
+            try:
+                vision_prompt = (
+                    "Analisis screenshot website ini:\n"
+                    "1. Apakah desainnya modern dan profesional?\n"
+                    "2. Apakah ada elemen yang tumpang tindih atau tidak rapi?\n"
+                    "3. Apakah tata letak (layout) sudah baik?\n"
+                    "4. Apakah ada masalah visual yang perlu diperbaiki?\n"
+                    "Berikan jawaban singkat dalam bahasa Indonesia."
+                )
+                if hasattr(self.provider, 'respond_with_image'):
+                    vision_analysis = self.provider.respond_with_image(
+                        vision_prompt, screenshot_path
+                    )
+                elif hasattr(self.provider, 'respond'):
+                    vision_analysis = (
+                        "Model vision tidak tersedia. Analisis berdasarkan kode HTML saja."
+                    )
+            except Exception as e:
+                self.logger.error(f"Vision analysis failed: {str(e)}")
+                vision_analysis = f"Analisis vision gagal: {str(e)}"
+
+        if self.ws_manager:
+            try:
+                await self.ws_manager.broadcast({
+                    "type": "visual_verification",
+                    "phase": "analysis_complete",
+                    "issues": visual_issues,
+                    "vision_analysis": vision_analysis[:500] if vision_analysis else "",
+                    "screenshot": screenshot_path if screenshot_taken else "",
+                    "has_modern_css": has_modern,
+                })
+            except Exception:
+                pass
+
+        if visual_issues:
+            fix_prompt = (
+                f"🔍 VISUAL VERIFICATION - PERBAIKAN DIPERLUKAN\n\n"
+                f"File yang diperiksa: {main_html}\n\n"
+                f"Masalah visual yang ditemukan:\n"
+            )
+            for i, issue in enumerate(visual_issues, 1):
+                fix_prompt += f"  {i}. {issue}\n"
+
+            if vision_analysis:
+                fix_prompt += f"\nAnalisis visual AI:\n{vision_analysis[:500]}\n"
+
+            fix_prompt += (
+                f"\nINSTRUKSI:\n"
+                f"1. Perbaiki SEMUA masalah visual di atas\n"
+                f"2. Pastikan desain MODERN (gunakan flexbox/grid, shadow, gradient, border-radius)\n"
+                f"3. Pastikan RESPONSIVE (meta viewport + media queries)\n"
+                f"4. Pastikan TIDAK ADA elemen yang tumpang tindih\n"
+                f"5. Tulis ulang file HTML yang sudah diperbaiki secara LENGKAP"
+            )
+
+            self.logger.info(f"Visual verification found {len(visual_issues)} issues, requesting fix")
+            return fix_prompt
+
+        self.logger.info("Visual verification passed - no issues found")
+        pretty_print("✅ Visual Verification: desain terlihat baik!", color="success")
+
+        if self.ws_manager:
+            try:
+                await self.ws_manager.broadcast({
+                    "type": "visual_verification",
+                    "phase": "passed",
+                    "details": "Verifikasi visual berhasil - tidak ada masalah ditemukan",
+                })
+            except Exception:
+                pass
+
+        return None
+
     async def run_loop(self, goal: str, agent_tasks: list, speech_module=None) -> str:
         plan = self.create_plan_from_tasks(goal, agent_tasks)
         work_results = {}
@@ -491,6 +837,28 @@ class AutonomousOrchestrator:
             self.last_answer = plan.get_progress_text()
             await self._notify_plan(step.id)
             await self._send_progress(step.id, step.description)
+
+        visual_fix_prompt = await self._visual_verification(goal, work_results)
+        if visual_fix_prompt and "coder" in self.agents:
+            pretty_print("🎨 Memperbaiki masalah visual...", color="status")
+
+            if self.ws_manager:
+                try:
+                    await self.ws_manager.broadcast({
+                        "type": "visual_verification",
+                        "phase": "fixing",
+                        "details": "CoderAgent memperbaiki masalah visual...",
+                    })
+                except Exception:
+                    pass
+
+            coder = self.agents["coder"]
+            fix_answer, _ = await coder.process(visual_fix_prompt, None)
+            if coder.get_success:
+                pretty_print("✅ Perbaikan visual berhasil!", color="success")
+                final_answer = fix_answer
+            else:
+                pretty_print("⚠️ Perbaikan visual gagal, menggunakan hasil sebelumnya", color="warning")
 
         completed = sum(1 for s in plan.steps if s.status == "completed")
         total = len(plan.steps)
