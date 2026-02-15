@@ -114,7 +114,7 @@ def initialize_system():
         CoderAgent(
             name="coder",
             prompt_path=f"prompts/{personality_folder}/coder_agent.txt",
-            provider=provider, verbose=False
+            provider=provider, verbose=False, ws_manager=ws_manager
         ),
         FileAgent(
             name="File Agent",

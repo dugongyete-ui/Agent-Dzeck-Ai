@@ -61,6 +61,28 @@ Agent Dzeck AI adalah sistem AI agent otonom dengan kemampuan browsing web, ekse
 - Project name: Agent Dzeck AI
 
 ## Recent Changes
+- 2026-02-15: MAJOR FEATURE - 3 Advanced Capabilities:
+  - **Self-Correction** (code_agent.py): Auto-retry eksekusi kode max 3x saat error terdeteksi.
+    - Method _self_correct_execution() dengan loop retry terpisah dari main execution loop
+    - _has_error_in_output() mendeteksi 20+ jenis error Python
+    - LLM menganalisis error dan generate kode perbaikan otomatis
+    - WebSocket notifications (type: "self_correction") untuk setiap fase: analyzing_error, generating_fix, executing_fix, success/retry/exhausted
+  - **Multi-Tool** (code_agent.py + orchestrator.py): CoderAgent bisa panggil BrowserAgent untuk info
+    - set_browser_agent() menghubungkan CoderAgent ke BrowserAgent
+    - _browse_for_install_help(): auto-browse web saat pip install gagal
+    - _request_browser_info(): CoderAgent minta info dari BrowserAgent (dokumentasi, tutorial)
+    - orchestrator._setup_multi_tool() otomatis link agents saat init
+    - orchestrator._handle_install_failure_with_browsing() retry langkah dengan info dari web
+    - revise_plan() menambah langkah browse + retry saat "No module named" error
+    - WebSocket notifications (type: "multi_tool") untuk browser_assist, auto_browse_install, retry_with_browser_info
+  - **Visual Verification** (orchestrator.py): Verifikasi visual otomatis setelah buat website
+    - _visual_verification() mendeteksi HTML files dan cek kualitas visual
+    - Screenshot via BrowserAgent + analisis dengan vision model (respond_with_image)
+    - Cek: meta viewport, CSS modern (flexbox/grid/shadow), position:absolute berlebihan, z-index tinggi, HTML incomplete
+    - Jika ada masalah, otomatis minta CoderAgent perbaiki
+    - WebSocket notifications (type: "visual_verification") untuk setiap fase: starting, screenshot_taken, analysis_complete, fixing, passed
+  - planner_agent.py: meneruskan ws_manager ke CoderAgent sub-agents
+  - api.py: meneruskan ws_manager ke CoderAgent saat inisialisasi
 - 2026-02-15: FEATURE - Tambah provider Magma API (API publik tanpa API key)
   - Fungsi magma_fn di llm_provider.py memanggil https://magma-api.biz.id/ai/copilot?prompt={prompt}
   - Menggunakan requests.get (tanpa API key), respons JSON diekstrak bagian result.response
