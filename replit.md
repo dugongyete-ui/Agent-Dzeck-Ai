@@ -6,9 +6,10 @@ Agent Dzeck AI adalah sistem AI agent otonom dengan kemampuan browsing web, ekse
 ## Architecture
 - **Backend**: Python FastAPI (api.py) on port 5000
 - **Frontend**: React app pre-built at `frontend/agentic-seek-front/build/`, served as static files by FastAPI
-- **AI Providers**: Hanya 2 provider yang didukung:
-  - **Groq** - llama-3.3-70b-versatile (utama)
+- **AI Providers**: 3 provider yang didukung:
+  - **Groq** - llama-3.3-70b-versatile
   - **HuggingFace** - Qwen/Qwen2.5-72B-Instruct (gratis)
+  - **Magma** - copilot (API publik, tanpa API key)
 - **Agent System**: ML-based router (AdaptiveClassifier + keyword override) selects from 5 agents:
   - CasualAgent (Dzeck) - general conversation
   - CoderAgent (Coder) - Full-Stack Autonomous Developer with sandbox safety
@@ -27,7 +28,7 @@ Agent Dzeck AI adalah sistem AI agent otonom dengan kemampuan browsing web, ekse
 ## Key Files
 - `api.py` - FastAPI server, serves frontend + API endpoints
 - `config.ini` - Configuration (provider, model, browser settings, work_dir)
-- `sources/llm_provider.py` - LLM provider (hanya Groq dan HuggingFace)
+- `sources/llm_provider.py` - LLM provider (Groq, HuggingFace, Magma)
 - `sources/interaction.py` - Main interaction loop
 - `sources/router.py` - Agent routing (keyword override + AdaptiveClassifier)
 - `sources/browser.py` - Browser automation via Selenium
@@ -43,9 +44,10 @@ Agent Dzeck AI adalah sistem AI agent otonom dengan kemampuan browsing web, ekse
 - `setup_dependencies.sh` - Auto-install all dependencies (dengan --break-system-packages)
 
 ## Configuration
-- Provider: huggingface atau groq (set in config.ini)
-- HUGGINGFACE_API_KEY: stored as secret
-- GROQ_API_KEY: stored as secret
+- Provider: magma, huggingface, atau groq (set in config.ini)
+- HUGGINGFACE_API_KEY: stored as secret (untuk provider huggingface)
+- GROQ_API_KEY: stored as secret (untuk provider groq)
+- Magma: tanpa API key (API publik)
 - agent_name: Dzeck
 - Browser: headless mode
 - work_dir: /home/runner/workspace/work
@@ -53,11 +55,18 @@ Agent Dzeck AI adalah sistem AI agent otonom dengan kemampuan browsing web, ekse
 
 ## User Preferences
 - Language: Indonesian (Bahasa Indonesia)
-- Hanya gunakan 2 provider: Groq dan HuggingFace
+- 3 provider didukung: Groq, HuggingFace, dan Magma
 - Provider lain (OpenAI, DeepSeek, Together, Google, OpenRouter, Ollama, Anthropic, LM-Studio) sudah dihapus
+- Magma adalah default (tanpa API key, API publik)
 - Project name: Agent Dzeck AI
 
 ## Recent Changes
+- 2026-02-15: FEATURE - Tambah provider Magma API (API publik tanpa API key)
+  - Fungsi magma_fn di llm_provider.py memanggil https://magma-api.biz.id/ai/copilot?prompt={prompt}
+  - Menggunakan requests.get (tanpa API key), respons JSON diekstrak bagian result.response
+  - Terdaftar sebagai provider "magma" di available_providers
+  - config.ini default diubah ke magma/copilot
+  - Semua agent (CoderAgent, PlannerAgent, dll) otomatis bisa menggunakan Magma karena melalui kelas Provider
 - 2026-02-15: FIX - Browser tab tidak muncul di mobile + screenshot tidak auto-refresh
   - Mobile bottom nav sekarang menampilkan semua 5 tab (Chat, Preview, Editor, Files, Browser)
   - CSS responsive: padding/font-size diperkecil untuk 5 tab di mobile
